@@ -1,0 +1,12 @@
+# macOS
+.DS_Store
+
+# Xcode 用户级数据
+xcuserdata/
+
+# 构建产物
+build/
+DerivedData/
+
+# 其他
+*.xcuserstate
