@@ -186,7 +186,7 @@ nonisolated final class Wan引擎 {
         return 目录 + "/." + 名 + ".fp16v\(Self.缓存版本).cache"
     }
 
-    /// 缓存命中则零拷贝挂载（每张量一个 bytesNoCopy MTLBuffer，无 GPU 转换、无 CPU 搬运）。
+    /// 缓存命中则按张量逐个拷入真实 MTLBuffer（GPU 直接可用，占用计入进程 footprint）。
     private func 尝试载入缓存(源: String, 权重库: SafeTensors权重库) -> 权重池? {
         let 路径 = 缓存路径(源: 源)
         guard let 属性 = try? FileManager.default.attributesOfItem(atPath: 源),
@@ -216,13 +216,11 @@ nonisolated final class Wan引擎 {
         for t in 头.张量 {
             guard 元素表[t.名] == t.元素, t.偏移 % Self.缓存对齐 == 0,
                   t.偏移 >= 0, t.偏移 + t.元素 * 2 <= 数据.count else { return nil }
-            guard let 缓冲 = 设备.makeBuffer(bytesNoCopy: 基址.advanced(by: t.偏移),
-                                          length: t.元素 * 2, options: .storageModeShared,
-                                          deallocator: nil) else { return nil }
+            guard let 缓冲 = 设备.makeBuffer(bytes: 基址.advanced(by: t.偏移),
+                                          length: t.元素 * 2, options: .storageModeShared) else { return nil }
             缓冲.label = t.名
             缓冲表[t.名] = 缓冲
         }
-        缓存映射 = 数据   // 保活：MTLBuffer 只是指向 mmap 的裸指针
         return 权重池(缓冲表: 缓冲表)
     }
 
