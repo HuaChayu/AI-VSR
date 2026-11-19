@@ -23,6 +23,8 @@ final class 素材Store {
     var 搜索词 = ""
     var 错误信息: String?
     var onNote: ((String) -> Void)?
+    /// 「跳过不支持的文件」这条提示的过期计时；重复触发时取消旧计时，重新开始计。
+    @ObservationIgnored private var 跳过提示计时: Task<Void, Never>?
 
     // MARK: 派生
 
@@ -77,13 +79,28 @@ final class 素材Store {
         }
 
         if 不支持 > 0 {
-            错误信息 = "跳过 \(不支持) 个不支持的文件（仅支持视频 / 图片）"
+            提示跳过不支持(不支持)
         }
         if 新增 > 0 {
             onNote?("已导入 \(新增) 个素材")
             await 载入预览(时间: 0.5)
         } else if 重复 > 0 {
             onNote?("\(重复) 个素材已在素材箱中，未重复导入")
+        }
+    }
+
+    /// 短暂提示「跳过 N 个不支持的文件」：约 2.5 秒后自动清空。
+    /// 重复拖拽/导入时取消旧计时重新计，界面始终只有这一条，不叠加。
+    /// 期间若 错误信息 被别的文案（如文件导入失败）覆盖，则不动它，避免误清别人的提示。
+    private func 提示跳过不支持(_ 数量: Int) {
+        let 文本 = "跳过 \(数量) 个不支持的文件（仅支持视频 / 图片）"
+        错误信息 = 文本
+        跳过提示计时?.cancel()
+        跳过提示计时 = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 2_500_000_000)
+            guard !Task.isCancelled, let self else { return }
+            if self.错误信息 == 文本 { self.错误信息 = nil }
+            self.跳过提示计时 = nil
         }
     }
 

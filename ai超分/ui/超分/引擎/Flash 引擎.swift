@@ -77,6 +77,9 @@ nonisolated final class Flash引擎 {
         let 偏置: MTLBuffer?
         let 输出维: Int
         let 输入维: Int
+        /// 权重在内存中以 fp16 常驻、GEMM 走 MPS half 路径（f32 仅用于必须的累加与归一化）
+        /// 必填，避免 f32 权重被误当 fp16 读取
+        let 半精度: Bool
     }
 
     struct 注意力权重 {
@@ -118,6 +121,8 @@ nonisolated final class Flash引擎 {
     private var 管线RoPE半: MTLComputePipelineState!
     private var 管线注意力打包半: MTLComputePipelineState!
     private var 管线转换半: MTLComputePipelineState!
+    /// fp16 → f32 回写（fp16 GEMM 输出接 f32 逐元素算子）
+    private var 管线转换单: MTLComputePipelineState!
     /// 唯一注意力内核：64 维头、simdgroup MMA 版（每组 16 查询、线程组 64 线程）
     private var 管线注意力打包: MTLComputePipelineState!
     private var 管线SwiGLU: MTLComputePipelineState!
@@ -128,6 +133,25 @@ nonisolated final class Flash引擎 {
     private var 管线拷贝: MTLComputePipelineState!
     private var 管线重排: MTLComputePipelineState!
     private var 管线双三次: MTLComputePipelineState!
+
+    // 激活全链 fp16：逐元素算子的半精度变体（读 half 转 f32 计算、写回 half，数值路径不变）
+    private var 管线im2col半: MTLComputePipelineState!
+    private var 管线im2col半输入单: MTLComputePipelineState!
+    private var 管线偏置激活半: MTLComputePipelineState!
+    private var 管线偏置激活V4半: MTLComputePipelineState!
+    private var 管线归一化半: MTLComputePipelineState!
+    private var 管线SwiGLU半: MTLComputePipelineState!
+    private var 管线SwiGLU偏置半: MTLComputePipelineState!
+    private var 管线相加半: MTLComputePipelineState!
+    private var 管线原地相加半: MTLComputePipelineState!
+    private var 管线加行向量半: MTLComputePipelineState!
+    private var 管线拷贝半: MTLComputePipelineState!
+    private var 管线重排半: MTLComputePipelineState!
+    private var 管线双三次半: MTLComputePipelineState!
+
+    /// GEMM 形状参数缓存：每帧每层形状固定，避免重复创建 MPS 描述符与乘法算子
+    private var 乘法缓存: [String: MPSMatrixMultiplication] = [:]
+    private var 矩阵描述缓存: [String: MPSMatrixDescriptor] = [:]
 
     // 权重
     private var 编码器层: [(线性层, Int, Int, Int)]!   // (层权重, 卷积核, 步长, 填充)
@@ -177,9 +201,10 @@ nonisolated final class Flash引擎 {
         管线归一化 = try 建管线("flash_rmsnorm")
         管线RoPE = try 建管线("flash_rope")
         管线RoPE半 = try 建管线("flash_rope_half")
-        管线注意力打包半 = try 建管线("flash_attention_mma_h_16_16")
+        管线注意力打包半 = try 建管线("flash_attention_mma_h_32_16")
         管线转换半 = try 建管线("flash_cast_f2h")
-        管线注意力打包 = try 建管线("flash_attention_mma_16_16")
+        管线转换单 = try 建管线("flash_cast_h2f")
+        管线注意力打包 = try 建管线("flash_attention_mma_32_16")
         管线SwiGLU = try 建管线("flash_swiglu")
         管线SwiGLU偏置 = try 建管线("flash_swiglu_bias_v4")
         管线SwiGLUV4 = try 建管线("flash_swiglu_v4")
@@ -189,6 +214,19 @@ nonisolated final class Flash引擎 {
         管线拷贝 = try 建管线("flash_copy")
         管线重排 = try 建管线("flash_pixel_shuffle")
         管线双三次 = try 建管线("flash_bicubic_add")
+        管线im2col半 = try 建管线("flash_im2col_h")
+        管线im2col半输入单 = try 建管线("flash_im2col_f2h")
+        管线偏置激活半 = try 建管线("flash_bias_act_h")
+        管线偏置激活V4半 = try 建管线("flash_bias_act_v4_h")
+        管线归一化半 = try 建管线("flash_rmsnorm_h")
+        管线SwiGLU半 = try 建管线("flash_swiglu_h")
+        管线SwiGLU偏置半 = try 建管线("flash_swiglu_bias_v4_h")
+        管线相加半 = try 建管线("flash_add_h")
+        管线原地相加半 = try 建管线("flash_add_inplace_h")
+        管线加行向量半 = try 建管线("flash_add_row_vector_h")
+        管线拷贝半 = try 建管线("flash_copy_h")
+        管线重排半 = try 建管线("flash_pixel_shuffle_h")
+        管线双三次半 = try 建管线("flash_bicubic_add_h")
 
         // MARK: 权重装载
 
@@ -222,22 +260,58 @@ nonisolated final class Flash引擎 {
             return 缓冲
         }
 
+        func 上传半(_ 名: String, 形状 期望形状: [Int]) throws -> MTLBuffer {
+            let (形状, 数值) = try 取张量(名)
+            guard 形状 == 期望形状 else {
+                throw 错误.尺寸不符("\(名) 期望 \(期望形状) 实际 \(形状)")
+            }
+            return try 建半缓冲(名, 数值)
+        }
+
+        func 上传半压平(_ 名: String, 期望元素数: Int) throws -> MTLBuffer {
+            let (实际形状, 数值) = try 取张量(名)
+            guard 实际形状.reduce(1, *) == 期望元素数 else {
+                throw 错误.尺寸不符("\(名) 期望 \(期望元素数) 个元素 实际 \(实际形状)")
+            }
+            return try 建半缓冲(名, 数值)
+        }
+
+        func 建半缓冲(_ 名: String, _ 数值: [Float]) throws -> MTLBuffer {
+            let 半值 = 数值.map { Float16($0) }
+            guard let 缓冲 = 设备.makeBuffer(bytes: 半值,
+                                            length: 半值.count * MemoryLayout<Float16>.stride,
+                                            options: .storageModeShared) else {
+                throw 错误.初始化失败("上传 \(名) 失败")
+            }
+            return 缓冲
+        }
+
         func 可选上传(_ 名: String, 期望形状: [Int]) throws -> MTLBuffer? {
             guard 权重库.是否包含(名) else { return nil }
             return try 上传(名, 形状: 期望形状)
         }
 
         func 线性(_ 前缀: String, 输出维: Int, 输入维: Int) throws -> 线性层 {
-            let 权重 = try 上传压平("\(前缀).weight", 期望元素数: 输出维 * 输入维)
+            // fp16 GEMM 要求行字节 8 字节对齐，维度非 4 的倍数时退回 f32 路径
+            let 可半精度 = (输出维 % 4 == 0 && 输入维 % 4 == 0)
+            let 权重 = 可半精度
+                ? try 上传半压平("\(前缀).weight", 期望元素数: 输出维 * 输入维)
+                : try 上传压平("\(前缀).weight", 期望元素数: 输出维 * 输入维)
             let 偏置 = try 可选上传("\(前缀).bias", 期望形状: [输出维])
-            return 线性层(权重: 权重, 偏置: 偏置, 输出维: 输出维, 输入维: 输入维)
+            return 线性层(权重: 权重, 偏置: 偏置, 输出维: 输出维, 输入维: 输入维,
+                       半精度: 可半精度)
         }
 
         func 卷积(_ 前缀: String, 输出维: Int, 输入维: Int, 核: Int) throws -> 线性层 {
-            let 权重 = try 上传("\(前缀).weight", 形状: [输出维, 输入维, 核, 核])
+            let 内维 = 输入维 * 核 * 核
+            let 可半精度 = (输出维 % 4 == 0 && 内维 % 4 == 0)
+            let 权重 = 可半精度
+                ? try 上传半("\(前缀).weight", 形状: [输出维, 输入维, 核, 核])
+                : try 上传("\(前缀).weight", 形状: [输出维, 输入维, 核, 核])
             let 偏置 = try 可选上传("\(前缀).bias", 期望形状: [输出维])
             // 展平后的内维是 通道数 × 核面积，与 im2col 的列数一致
-            return 线性层(权重: 权重, 偏置: 偏置, 输出维: 输出维, 输入维: 输入维 * 核 * 核)
+            return 线性层(权重: 权重, 偏置: 偏置, 输出维: 输出维, 输入维: 内维,
+                       半精度: 可半精度)
         }
 
         let 维度 = 形状.维度
@@ -256,20 +330,21 @@ nonisolated final class Flash引擎 {
             }
             let 原始列数 = 3 * 3 * 3
             let 补齐列数 = 28
-            var 补齐 = [Float](repeating: 0, count: 编码通道[0] * 补齐列数)
+            var 补齐 = [Float16](repeating: 0, count: 编码通道[0] * 补齐列数)
             for 行 in 0..<编码通道[0] {
                 for 列 in 0..<原始列数 {
-                    补齐[行 * 补齐列数 + 列] = 数值[行 * 原始列数 + 列]
+                    补齐[行 * 补齐列数 + 列] = Float16(数值[行 * 原始列数 + 列])
                 }
             }
             guard let 权重缓冲 = 设备.makeBuffer(bytes: 补齐,
-                                               length: 补齐.count * MemoryLayout<Float>.stride,
+                                               length: 补齐.count * MemoryLayout<Float16>.stride,
                                                options: .storageModeShared) else {
                 throw 错误.初始化失败("上传 lr_encoder.layers.0.weight 失败")
             }
             let 偏置 = try 上传("lr_encoder.layers.0.bias", 形状: [编码通道[0]])
             编码层.append((线性层(权重: 权重缓冲, 偏置: 偏置,
-                              输出维: 编码通道[0], 输入维: 补齐列数), 3, 2, 1))
+                              输出维: 编码通道[0], 输入维: 补齐列数,
+                              半精度: (编码通道[0] % 4 == 0 && 补齐列数 % 4 == 0)), 3, 2, 1))
         }
 
         编码层.append((try 卷积("lr_encoder.layers.2", 输出维: 编码通道[1], 输入维: 编码通道[0], 核: 3), 3, 2, 1))
@@ -356,6 +431,38 @@ nonisolated final class Flash引擎 {
         return 输出
     }
 
+    /// 线性 GEMM 的 fp16 输入/输出暂存：同一时刻只有一路线性在编码，各一块按最大尺寸复用即可
+    private var 半输入暂存: MTLBuffer?
+    private var 半输出暂存: MTLBuffer?
+
+    private func 半暂存(_ 元素数: Int, 输入侧: Bool) -> MTLBuffer {
+        let 需要 = max(元素数, 1) * MemoryLayout<UInt16>.stride
+        if 输入侧 {
+            if let 现有 = 半输入暂存, 现有.length >= 需要 { return 现有 }
+            let 新建 = 新建半(元素数, "线性输入 fp16 暂存")
+            半输入暂存 = 新建
+            return 新建
+        }
+        if let 现有 = 半输出暂存, 现有.length >= 需要 { return 现有 }
+        let 新建 = 新建半(元素数, "线性输出 fp16 暂存")
+        半输出暂存 = 新建
+        return 新建
+    }
+
+    /// fp16 → f32：让半精度 GEMM 的输出直接接现有 f32 逐元素算子（偏置/SiLU/残差等）
+    private func 转回单(_ 命令: MTLCommandBuffer,
+                     _ 源: MTLBuffer,
+                     _ 元素数: Int,
+                     _ 目标: MTLBuffer) {
+        var 参数 = CopyParams(count: Int32(元素数))
+        派发(命令, 管线转换单, MTLSize(width: 元素数, height: 1, depth: 1),
+            MTLSize(width: 256, height: 1, depth: 1)) { 编码器 in
+            编码器.setBuffer(源, offset: 0, index: 0)
+            编码器.setBuffer(目标, offset: 0, index: 1)
+            编码器.setBytes(&参数, length: MemoryLayout<CopyParams>.stride, index: 2)
+        }
+    }
+
     /// f32 源 → 半精度目标的指定位置（当前帧 KV 落进滚动缓存）
     private func 写半(_ 命令: MTLCommandBuffer,
                    _ 源: MTLBuffer,
@@ -397,10 +504,20 @@ nonisolated final class Flash引擎 {
     /// 归还全部临时缓冲（同一命令缓冲内跨层复用）：池规模收敛到「单层并发峰值 × 最大尺寸」。
     private func 释放临时() { 在用临时.removeAll(keepingCapacity: true) }
 
-    /// 借一块至少容纳 元素数 个 float 的临时缓冲。
+    /// 借一块至少容纳 元素数 个**半精度**激活的临时缓冲（激活全链 fp16 后池的默认元素宽度）。
     /// 按「容量最省的最优匹配」复用，避免尺寸逐帧增长时按位置游标不断新开缓冲导致显存膨胀。
+    /// 池内按字节容量匹配，fp32 需求走 借单，不会误取到只够半精度的小块。
     private func 借(_ 元素数: Int) -> MTLBuffer {
-        let 需字节 = 元素数 * MemoryLayout<Float>.stride
+        借用(元素数, 每元素字节: MemoryLayout<UInt16>.stride, 名称: "flash 临时")
+    }
+
+    /// 借一块 fp32 临时缓冲：只给维度非 4 倍数的回退线性层用
+    private func 借单(_ 元素数: Int) -> MTLBuffer {
+        借用(元素数, 每元素字节: MemoryLayout<Float>.stride, 名称: "flash 临时 fp32")
+    }
+
+    private func 借用(_ 元素数: Int, 每元素字节: Int, 名称: String) -> MTLBuffer {
+        let 需字节 = max(元素数, 1) * 每元素字节
         var 最优 = -1
         for 索引 in 临时缓冲.indices where !在用临时.contains(索引) && 临时缓冲[索引].length >= 需字节 {
             if 最优 < 0 || 临时缓冲[索引].length < 临时缓冲[最优].length { 最优 = 索引 }
@@ -409,7 +526,10 @@ nonisolated final class Flash引擎 {
             在用临时.insert(最优)
             return 临时缓冲[最优]
         }
-        let 缓冲 = 新建(元素数, "flash 临时 \(临时缓冲.count)")
+        guard let 缓冲 = 设备.makeBuffer(length: 需字节, options: .storageModeShared) else {
+            fatalError("Flash 引擎分配缓冲失败：\(名称)")
+        }
+        缓冲.label = "\(名称) \(临时缓冲.count)"
         临时缓冲.append(缓冲)
         在用临时.insert(临时缓冲.count - 1)
         return 缓冲
@@ -459,40 +579,51 @@ nonisolated final class Flash引擎 {
     }
 
     /// C[行数, 输出维] = A[行数, 内维] @ W[输出维, 内维]^T
+    /// 半 = true 时 A/W/C 均为 fp16（MPS half 路径，峰值算力为 f32 的两倍、带宽减半）
     private func 矩阵乘法(_ 命令: MTLCommandBuffer,
                        _ 左侧: MTLBuffer,
                        _ 行数: Int,
                        _ 内维: Int,
                        _ 权重: MTLBuffer,
                        _ 输出维: Int,
-                       _ 结果: MTLBuffer) {
-        let 左描述 = MPSMatrixDescriptor(rows: 行数,
-                                        columns: 内维,
-                                        rowBytes: 内维 * MemoryLayout<Float>.stride,
-                                        dataType: .float32)
-        let 右描述 = MPSMatrixDescriptor(rows: 输出维,
-                                        columns: 内维,
-                                        rowBytes: 内维 * MemoryLayout<Float>.stride,
-                                        dataType: .float32)
-        let 果描述 = MPSMatrixDescriptor(rows: 行数,
-                                        columns: 输出维,
-                                        rowBytes: 输出维 * MemoryLayout<Float>.stride,
-                                        dataType: .float32)
-        let 左矩阵 = MPSMatrix(buffer: 左侧, descriptor: 左描述)
-        let 右矩阵 = MPSMatrix(buffer: 权重, descriptor: 右描述)
-        let 果矩阵 = MPSMatrix(buffer: 结果, descriptor: 果描述)
-        let 乘法 = MPSMatrixMultiplication(device: 设备,
-                                          transposeLeft: false,
-                                          transposeRight: true,
-                                          resultRows: 行数,
-                                          resultColumns: 输出维,
-                                          interiorColumns: 内维,
-                                          alpha: 1,
-                                          beta: 0)
+                       _ 结果: MTLBuffer,
+                       _ 半: Bool = false) {
+        let 左矩阵 = MPSMatrix(buffer: 左侧, descriptor: 矩阵描述(行数, 内维, 半))
+        let 右矩阵 = MPSMatrix(buffer: 权重, descriptor: 矩阵描述(输出维, 内维, 半))
+        let 果矩阵 = MPSMatrix(buffer: 结果, descriptor: 矩阵描述(行数, 输出维, 半))
+        let 乘键 = "M\(半 ? "h" : "f")\(行数)_\(内维)_\(输出维)"
+        let 乘法: MPSMatrixMultiplication
+        if let 命中 = 乘法缓存[乘键] {
+            乘法 = 命中
+        } else {
+            let 新建 = MPSMatrixMultiplication(device: 设备,
+                                              transposeLeft: false,
+                                              transposeRight: true,
+                                              resultRows: 行数,
+                                              resultColumns: 输出维,
+                                              interiorColumns: 内维,
+                                              alpha: 1,
+                                              beta: 0)
+            乘法缓存[乘键] = 新建
+            乘法 = 新建
+        }
         乘法.encode(commandBuffer: 命令,
                    leftMatrix: 左矩阵,
                    rightMatrix: 右矩阵,
                    resultMatrix: 果矩阵)
+    }
+
+    /// 矩阵描述按形状与精度缓存：每帧每层形状固定，避免重复分配 MPS 对象
+    private func 矩阵描述(_ 行数: Int, _ 列数: Int, _ 半: Bool) -> MPSMatrixDescriptor {
+        let 键 = "\(半 ? "h" : "f")\(行数)_\(列数)"
+        if let 命中 = 矩阵描述缓存[键] { return 命中 }
+        let 新建 = MPSMatrixDescriptor(rows: 行数,
+                                      columns: 列数,
+                                      rowBytes: 列数 * (半 ? MemoryLayout<UInt16>.stride
+                                                          : MemoryLayout<Float>.stride),
+                                      dataType: 半 ? .float16 : .float32)
+        矩阵描述缓存[键] = 新建
+        return 新建
     }
 
     /// Y[行数, 输出维] = X @ W^T + b（可选 SiLU）
@@ -503,20 +634,32 @@ nonisolated final class Flash引擎 {
                     _ 结果: MTLBuffer,
                     _ 激活: Bool,
                     仅矩阵乘: Bool = false) {
-        矩阵乘法(命令, 输入, 行数, 层.输入维, 层.权重, 层.输出维, 结果)
+        if 层.半精度 {
+            // 激活全链 fp16：输入输出本身都是半精度缓冲，GEMM 直接读写，两端不再有 cast pass
+            矩阵乘法(命令, 输入, 行数, 层.输入维, 层.权重, 层.输出维, 结果, true)
+        } else {
+            // 维度非 4 倍数的回退层：就地补两次转换，代价只落在极少数层上
+            let 输入元素 = 行数 * 层.输入维
+            let 输入单 = 借单(输入元素)
+            转回单(命令, 输入, 输入元素, 输入单)
+            let 输出元素 = 行数 * 层.输出维
+            let 结果单 = 借单(输出元素)
+            矩阵乘法(命令, 输入单, 行数, 层.输入维, 层.权重, 层.输出维, 结果单)
+            转为半(命令, 结果单, 输出元素, "线性输出 fp16", 目标: 结果)
+        }
         if 仅矩阵乘 { return }
         var 参数 = BiasParams(rows: Int32(行数), cols: Int32(层.输出维),
                               hasBias: 层.偏置 == nil ? 0 : 1, act: 激活 ? 1 : 0)
         if 层.输出维 % 4 == 0 {
             // 向量化路径：gid.x 沿列方向（float4），线程组 64×4=256 线程，合并访存
-            派发(命令, 管线偏置激活V4, MTLSize(width: 层.输出维 / 4, height: 行数, depth: 1),
+            派发(命令, 管线偏置激活V4半, MTLSize(width: 层.输出维 / 4, height: 行数, depth: 1),
                 MTLSize(width: 64, height: 4, depth: 1)) { 编码器 in
                 编码器.setBuffer(结果, offset: 0, index: 0)
                 编码器.setBuffer(层.偏置 ?? 结果, offset: 0, index: 1)
                 编码器.setBytes(&参数, length: MemoryLayout<BiasParams>.stride, index: 2)
             }
         } else {
-            派发(命令, 管线偏置激活, MTLSize(width: 行数, height: 层.输出维, depth: 1),
+            派发(命令, 管线偏置激活半, MTLSize(width: 行数, height: 层.输出维, depth: 1),
                 MTLSize(width: 1, height: 16, depth: 1)) { 编码器 in
                 编码器.setBuffer(结果, offset: 0, index: 0)
                 编码器.setBuffer(层.偏置 ?? 结果, offset: 0, index: 1)
@@ -532,7 +675,7 @@ nonisolated final class Flash引擎 {
                      _ 输出: MTLBuffer) {
         var 参数 = NormParams(rows: Int32(行数), cols: Int32(形状.维度),
                               eps: Float(配置.归一化Eps))
-        派发组(命令, 管线归一化, MTLSize(width: 行数, height: 1, depth: 1),
+        派发组(命令, 管线归一化半, MTLSize(width: 行数, height: 1, depth: 1),
              MTLSize(width: 128, height: 1, depth: 1)) { 编码器 in
             编码器.setBuffer(输入, offset: 0, index: 0)
             编码器.setBuffer(权重, offset: 0, index: 1)
@@ -549,7 +692,7 @@ nonisolated final class Flash引擎 {
                        _ 列数: Int) {
         var 参数 = NormParams(rows: Int32(行数), cols: Int32(列数),
                               eps: Float(配置.归一化Eps))
-        派发组(命令, 管线归一化, MTLSize(width: 行数, height: 1, depth: 1),
+        派发组(命令, 管线归一化半, MTLSize(width: 行数, height: 1, depth: 1),
              MTLSize(width: 64, height: 1, depth: 1)) { 编码器 in
             编码器.setBuffer(缓冲, offset: 0, index: 0)
             编码器.setBuffer(权重, offset: 0, index: 1)
@@ -567,7 +710,7 @@ nonisolated final class Flash引擎 {
                        时间位置: Int32 = 0,
                        平面步长: Int32 = 0,
                        缓冲偏移: Int = 0,
-                       半精度: Bool = false) {
+                       半精度: Bool = true) {
         var 参数 = RoPEParams(tokens: Int32(令牌数), heads: Int32(头数), width: Int32(宽),
                               temporalPosition: 时间位置,
                               theta: Float(配置.RoPETheta),
@@ -605,7 +748,7 @@ nonisolated final class Flash引擎 {
                        _ 向量: MTLBuffer,
                        _ 行数: Int) {
         var 参数 = BiasParams(rows: Int32(行数), cols: Int32(形状.维度), hasBias: 1, act: 0)
-        派发(命令, 管线加行向量, MTLSize(width: 行数, height: 形状.维度, depth: 1),
+        派发(命令, 管线加行向量半, MTLSize(width: 行数, height: 形状.维度, depth: 1),
             MTLSize(width: 1, height: 32, depth: 1)) { 编码器 in
             编码器.setBuffer(缓冲, offset: 0, index: 0)
             编码器.setBuffer(向量, offset: 0, index: 1)
@@ -618,7 +761,7 @@ nonisolated final class Flash引擎 {
                        _ 增量: MTLBuffer,
                        _ 元素数: Int) {
         var 参数 = CopyParams(count: Int32(元素数))
-        派发(命令, 管线原地相加, MTLSize(width: 元素数, height: 1, depth: 1),
+        派发(命令, 管线原地相加半, MTLSize(width: 元素数, height: 1, depth: 1),
             MTLSize(width: 256, height: 1, depth: 1)) { 编码器 in
             编码器.setBuffer(目标, offset: 0, index: 0)
             编码器.setBuffer(增量, offset: 0, index: 1)
@@ -634,7 +777,7 @@ nonisolated final class Flash引擎 {
         var 参数 = BiasParams(rows: Int32(行数), cols: Int32(形状.隐藏维),
                               hasBias: 偏置 == nil ? 0 : 1, act: 0)
         if 形状.隐藏维 % 4 == 0 {
-            派发(命令, 管线SwiGLU偏置, MTLSize(width: 形状.隐藏维 / 4, height: 行数, depth: 1),
+            派发(命令, 管线SwiGLU偏置半, MTLSize(width: 形状.隐藏维 / 4, height: 行数, depth: 1),
                 MTLSize(width: 64, height: 4, depth: 1)) { 编码器 in
                 编码器.setBuffer(门控, offset: 0, index: 0)
                 编码器.setBuffer(偏置 ?? 门控, offset: 0, index: 1)
@@ -642,7 +785,7 @@ nonisolated final class Flash引擎 {
                 编码器.setBytes(&参数, length: MemoryLayout<BiasParams>.stride, index: 3)
             }
         } else {
-            派发(命令, 管线SwiGLU, MTLSize(width: 行数, height: 形状.隐藏维, depth: 1),
+            派发(命令, 管线SwiGLU半, MTLSize(width: 行数, height: 形状.隐藏维, depth: 1),
                 MTLSize(width: 1, height: 32, depth: 1)) { 编码器 in
                 编码器.setBuffer(门控, offset: 0, index: 0)
                 编码器.setBuffer(输出, offset: 0, index: 1)
@@ -686,12 +829,13 @@ nonisolated final class Flash引擎 {
         编码器.setBuffer(窗口值, offset: 0, index: 5)   // 无平面掩码时占位
         编码器.setBytes(&参数, length: MemoryLayout<AttnParams>.stride, index: 6)
 
-        // 唯一派发路径：MMA 内核 + 单遍在线 softmax（每组 4 查询 × 16 线程满波前，K/V 在 4 查询间复用）
+        // 唯一派发路径：MMA 内核 + 单遍在线 softmax（每组查询数 × 4 线程，K/V 在组内查询间复用）
         precondition(形状.头维 == 64, "注意力内核仅支持 64 维头")
-        let 每组查询数 = 16
+        let 每组查询数 = 32
         let 列组数 = (令牌宽 + 每组查询数 - 1) / 每组查询数
         let 组数 = 批次数 * 形状.头数 * 令牌高 * 列组数
-        编码器.setComputePipelineState(半精度 ? 管线注意力打包半 : 管线注意力打包)
+        precondition(半精度 || true, "激活全链 fp16 后 Q/K/V 均为半精度，固定走 half 内核")
+        编码器.setComputePipelineState(管线注意力打包半)
         编码器.dispatchThreadgroups(MTLSize(width: 组数, height: 1, depth: 1),
                                   threadsPerThreadgroup: MTLSize(width: 每组查询数 * 4, height: 1, depth: 1))
         编码器.endEncoding()
@@ -737,8 +881,8 @@ nonisolated final class Flash引擎 {
         let 起始令牌 = 编码条件(命令, 输入.起始条件, 令牌高, 令牌宽, "start")
         let 结束令牌 = 编码条件(命令, 输入.结束条件, 令牌高, 令牌宽, "end")
 
-        let 端点 = 新建(2 * 令牌数 * 形状.维度, "端点令牌")
-        let 行字节 = 令牌数 * 形状.维度 * MemoryLayout<Float>.stride
+        let 端点 = 新建半(2 * 令牌数 * 形状.维度, "端点令牌")
+        let 行字节 = 令牌数 * 形状.维度 * MemoryLayout<UInt16>.stride
         拷贝(命令, 起始令牌, 0, 端点, 0, 行字节)
         拷贝(命令, 结束令牌, 0, 端点, 行字节, 行字节)
 
@@ -747,7 +891,7 @@ nonisolated final class Flash引擎 {
                                  令牌数: 令牌数,
                                  令牌高: 令牌高,
                                  令牌宽: 令牌宽,
-                                 半精度: false)
+                                 半精度: true)
 
         let 隐藏 = 视频前向(命令,
                           低清令牌: 低清令牌,
@@ -823,7 +967,7 @@ nonisolated final class Flash引擎 {
                                     outH: Int32(出高), outW: Int32(出宽),
                                     outCols: Int32(列数), realCols: Int32(原始列数),
                                     channelsLast: 层索引 == 0 ? 0 : 1)
-            派发(命令, 管线im2col, MTLSize(width: 行数, height: 列数, depth: 1),
+            派发(命令, 层索引 == 0 ? 管线im2col半输入单 : 管线im2col半, MTLSize(width: 行数, height: 列数, depth: 1),
                 MTLSize(width: 16, height: 16, depth: 1)) { 编码器 in
                 编码器.setBuffer(当前, offset: 0, index: 0)
                 编码器.setBuffer(展开, offset: 0, index: 1)
@@ -860,7 +1004,7 @@ nonisolated final class Flash引擎 {
                                 outH: Int32(令牌高), outW: Int32(令牌宽),
                                 outCols: Int32(通道), realCols: Int32(通道),
                                 channelsLast: 0)
-        派发(命令, 管线im2col, MTLSize(width: 行数, height: 通道, depth: 1),
+        派发(命令, 管线im2col半输入单, MTLSize(width: 行数, height: 通道, depth: 1),
             MTLSize(width: 16, height: 16, depth: 1)) { 编码器 in
             编码器.setBuffer(latent, offset: 0, index: 0)
             编码器.setBuffer(展开, offset: 0, index: 1)
@@ -908,21 +1052,31 @@ nonisolated final class Flash引擎 {
 
             // 缓存的条件 K 保持**未旋转**：官方语义下条件时间位置（0 与 total-1）在每次
             // 解码时由调用方重新施加，缓存本身不含 RoPE。
-            let 键 = 新建(行数 * 键值维, "条件 K")
+            let 键 = 新建半(行数 * 键值维, "条件 K")
             线性(命令, 归一, 行数, 层.注意力.条件键, 键, false)
             分组归一化(命令, 键, 层.注意力.键归一化, 行数 * 形状.KV组数, 形状.头维)
             let 旋转键 = 借(行数 * 键值维)
-            拷贝(命令, 键, 0, 旋转键, 0, 行数 * 键值维 * MemoryLayout<Float>.stride)
+            拷贝(命令, 键, 0, 旋转键, 0, 行数 * 键值维 * MemoryLayout<UInt16>.stride)
             施加RoPE(命令, 旋转键, 行数, 形状.KV组数, 令牌宽, 令牌数)
 
-            let 值 = 新建(行数 * 键值维, "条件 V")
+            let 值 = 新建半(行数 * 键值维, "条件 V")
             线性(命令, 归一, 行数, 层.注意力.条件值, 值, false)
             分组归一化(命令, 值, 层.注意力.值归一化, 行数 * 形状.KV组数, 形状.头维)
 
             let 复用键 = (键目标?.count ?? 0) > 层索引 ? 键目标?[层索引] : nil
             let 复用值 = (值目标?.count ?? 0) > 层索引 ? 值目标?[层索引] : nil
-            let 键缓存 = 半精度 ? 转为半(命令, 键, 行数 * 键值维, "条件 K 半精度", 目标: 复用键) : 键
-            let 值缓存 = 半精度 ? 转为半(命令, 值, 行数 * 键值维, "条件 V 半精度", 目标: 复用值) : 值
+            // 条件 KV 本身已是半精度：只需在有跨窗复用目标时 blit 过去，无目标时直接持有
+            let 条件字节 = 行数 * 键值维 * MemoryLayout<UInt16>.stride
+            let 键缓存: MTLBuffer
+            if 半精度, let 复用 = 复用键, 复用.length >= 条件字节 {
+                拷贝(命令, 键, 0, 复用, 0, 条件字节)
+                键缓存 = 复用
+            } else { 键缓存 = 键 }
+            let 值缓存: MTLBuffer
+            if 半精度, let 复用 = 复用值, 复用.length >= 条件字节 {
+                拷贝(命令, 值, 0, 复用, 0, 条件字节)
+                值缓存 = 复用
+            } else { 值缓存 = 值 }
 
             let 注意力输出 = 借(行数 * 维度)
             窗口注意力(命令, 查询, 旋转键, 值, 注意力输出,
@@ -991,8 +1145,8 @@ nonisolated final class Flash引擎 {
 
             let 全部键 = 借((条件行数 + 令牌数) * 键值维)
             let 全部值 = 借((条件行数 + 令牌数) * 键值维)
-            let 条件字节 = 条件行数 * 键值维 * MemoryLayout<Float>.stride
-            let 视频字节 = 令牌数 * 键值维 * MemoryLayout<Float>.stride
+            let 条件字节 = 条件行数 * 键值维 * MemoryLayout<UInt16>.stride
+            let 视频字节 = 令牌数 * 键值维 * MemoryLayout<UInt16>.stride
             拷贝(命令, 条件键[索引], 0, 全部键, 0, 条件字节)
             拷贝(命令, 视频键, 0, 全部键, 条件字节, 视频字节)
             拷贝(命令, 条件值[索引], 0, 全部值, 0, 条件字节)
@@ -1055,6 +1209,10 @@ nonisolated final class Flash引擎 {
         var 总帧数 = 1
     }
 
+    /// 注意力真正可见的视频帧数（当前帧 + 其前驱）：核内按 relative <= -时间窗 裁剪平面。
+    /// 环容量与拼接缓冲都按它推导——比它更老的帧永远不会被读到，缓存与拷贝留着纯属浪费。
+    private var 视频时间窗帧数: Int { 2 }
+
     /// 建立流：编码两端点条件 latent 并预热各层条件 KV，同时分配滚动视频 KV。
     /// - 参数条件形状：[条件通道数, 高/4, 宽/4] fp32 NCHW（Wan fp16 输出必须先转 fp32）
     func 建立流(起始条件: MTLBuffer,
@@ -1081,10 +1239,10 @@ nonisolated final class Flash引擎 {
         }
 
         let 键值维 = 形状.KV组数 * 形状.头维
-        // 滚动 KV 环容量 = 窗口帧数：环内需要同时容纳「历史帧数（窗口帧数 − 1）+ 当前帧」。
-        // 若按「窗口帧数 − 1」分配，满历史时当前帧会写进最老帧的槽位，使最老平面被当前帧
-        // 重复填充、真正的第「历史帧数」帧被挤掉，任意帧的上下文组成因而随槽位回绕出现周期差。
-        let 最大历史帧 = max(配置.窗口帧数, 1)
+        // 滚动 KV 环容量 = 时间窗帧数 + 1：核内只保留 relative >= -时间窗 的平面，更老的帧读不到，
+        // 因此环只需容纳「时间窗内前驱 + 当前帧」。原文按窗口帧数（16）分配时，多出的 13 个槽位
+        // 每帧都要写一次、却永不参与注意力，纯属浪费带宽与显存，故收窄到实际参与深度（等价省略）。
+        let 最大历史帧 = max(视频时间窗帧数 + 1, 1)
 
         释放临时()
         guard let 命令 = 队列.makeCommandBuffer() else {
@@ -1093,8 +1251,8 @@ nonisolated final class Flash引擎 {
 
         let 起始令牌 = 编码条件(命令, 起始条件, 令牌高, 令牌宽, "start")
         let 结束令牌 = 编码条件(命令, 结束条件, 令牌高, 令牌宽, "end")
-        let 端点 = 新建(2 * 令牌数 * 形状.维度, "端点令牌")
-        let 行字节 = 令牌数 * 形状.维度 * 元素
+        let 端点 = 新建半(2 * 令牌数 * 形状.维度, "端点令牌")
+        let 行字节 = 令牌数 * 形状.维度 * MemoryLayout<UInt16>.stride
         拷贝(命令, 起始令牌, 0, 端点, 0, 行字节)
         拷贝(命令, 结束令牌, 0, 端点, 行字节, 行字节)
 
@@ -1104,7 +1262,7 @@ nonisolated final class Flash引擎 {
                                  令牌数: 令牌数,
                                  令牌高: 令牌高,
                                  令牌宽: 令牌宽,
-                                 半精度: 半精度KV)
+                                 半精度: true)
 
         命令.commit()
         try 等待完成(命令)
@@ -1120,20 +1278,18 @@ nonisolated final class Flash引擎 {
         状态.维度 = 形状.维度
         状态.最大历史帧 = 最大历史帧
         状态.总帧数 = max(总帧数, 1)
-        let 键值元素字节 = 半精度KV ? MemoryLayout<UInt16>.stride : MemoryLayout<Float>.stride
+        // 激活全链 fp16 后 KV 缓存一律半精度常驻，f32 KV 分支不再可达
+        _ = 半精度KV
+        let 键值元素字节 = MemoryLayout<UInt16>.stride
         状态.帧字节 = 令牌数 * 键值维 * 键值元素字节
-        状态.半精度KV = 半精度KV
+        状态.半精度KV = true
         状态.条件键 = 条件键半
         状态.条件值 = 条件值半
-        状态.视频键 = self.块.map { _ in 半精度KV
-            ? 新建半(最大历史帧 * 令牌数 * 键值维, "视频 K 缓存")
-            : 新建(最大历史帧 * 令牌数 * 键值维, "视频 K 缓存") }
-        状态.视频值 = self.块.map { _ in 半精度KV
-            ? 新建半(最大历史帧 * 令牌数 * 键值维, "视频 V 缓存")
-            : 新建(最大历史帧 * 令牌数 * 键值维, "视频 V 缓存") }
+        状态.视频键 = self.块.map { _ in 新建半(最大历史帧 * 令牌数 * 键值维, "视频 K 缓存") }
+        状态.视频值 = self.块.map { _ in 新建半(最大历史帧 * 令牌数 * 键值维, "视频 V 缓存") }
         let 拼接元素 = (2 * 令牌数 + (最大历史帧 + 1) * 令牌数) * 键值维
-        状态.拼接键 = 半精度KV ? 新建半(拼接元素, "KV 拼接 K") : 新建(拼接元素, "KV 拼接 K")
-        状态.拼接值 = 半精度KV ? 新建半(拼接元素, "KV 拼接 V") : 新建(拼接元素, "KV 拼接 V")
+        状态.拼接键 = 新建半(拼接元素, "KV 拼接 K")
+        状态.拼接值 = 新建半(拼接元素, "KV 拼接 V")
         // 超分输出缓冲（每帧约百 MB）随会话常驻复用，不再每帧新建
         let 出高 = 令牌高 * 形状.重排倍数
         let 出宽 = 令牌宽 * 形状.重排倍数
@@ -1176,8 +1332,8 @@ nonisolated final class Flash引擎 {
         }
         let 起始令牌 = 编码条件(命令, 起始条件, 状态.令牌高, 状态.令牌宽, "start")
         let 结束令牌 = 编码条件(命令, 结束条件, 状态.令牌高, 状态.令牌宽, "end")
-        let 端点 = 新建(2 * 令牌数 * 状态.维度, "端点令牌")
-        let 行字节 = 令牌数 * 状态.维度 * 元素
+        let 端点 = 新建半(2 * 令牌数 * 状态.维度, "端点令牌")
+        let 行字节 = 令牌数 * 状态.维度 * MemoryLayout<UInt16>.stride
         拷贝(命令, 起始令牌, 0, 端点, 0, 行字节)
         拷贝(命令, 结束令牌, 0, 端点, 行字节, 行字节)
         let (条件键, 条件值) = 预热(命令,
@@ -1185,7 +1341,7 @@ nonisolated final class Flash引擎 {
                                 令牌数: 令牌数,
                                 令牌高: 状态.令牌高,
                                 令牌宽: 状态.令牌宽,
-                                半精度: 状态.半精度KV,
+                                半精度: true,
                                 键目标: 状态.条件键,
                                 值目标: 状态.条件值)
         命令.commit()
@@ -1219,6 +1375,10 @@ nonisolated final class Flash引擎 {
         // 历史深度上限 = 环容量 − 1（当前帧自己占一格），保证历史帧不与当前帧抢同一槽位。
         let 历史帧数 = min(已出帧数, max(最大历史帧 - 1, 0))
         let 总帧数 = 历史帧数 + 1
+        // 注意力真正可见的视频平面数：核内按 relative <= -时间窗 裁剪，
+        // 比时间窗更老的帧既不会被读到，组装/拷贝/RoPE 也就不该产出（等价省略）。
+        let 时间窗帧数 = 视频时间窗帧数
+        let 参与帧数 = min(总帧数, 时间窗帧数)
         let 条件行数 = 2 * 令牌数
         let 视频键缓存 = 状态.视频键
         let 视频值缓存 = 状态.视频值
@@ -1247,7 +1407,7 @@ nonisolated final class Flash引擎 {
             (高: 配置.空间注意力.起始条件窗[0], 宽: 配置.空间注意力.起始条件窗[1]),
             (高: 配置.空间注意力.结束条件窗[0], 宽: 配置.空间注意力.结束条件窗[1])
         ]
-        窗口.append(contentsOf: Array(repeating: 视频窗, count: 总帧数))
+        窗口.append(contentsOf: Array(repeating: 视频窗, count: 参与帧数))
 
         let 隐藏 = 低清令牌
         // 单块（注意力 + 前馈）编码抽成局部闭包，便于按命令缓冲分段提交。
@@ -1269,20 +1429,16 @@ nonisolated final class Flash引擎 {
             线性(命令, 归一, 令牌数, 层.注意力.值, 当前值, false)
             分组归一化(命令, 当前值, 层.注意力.值归一化, 令牌数 * 形状.KV组数, 形状.头维)
 
-            if 状态.半精度KV {
-                写半(命令, 当前键, 视频键缓存[索引], 槽 * 帧字节, 令牌数 * 键值维)
-                写半(命令, 当前值, 视频值缓存[索引], 槽 * 帧字节, 令牌数 * 键值维)
-            } else {
-                拷贝(命令, 当前键, 0, 视频键缓存[索引], 槽 * 帧字节, 帧字节)
-                拷贝(命令, 当前值, 0, 视频值缓存[索引], 槽 * 帧字节, 帧字节)
-            }
+            // 当前帧 K/V 已是半精度，直接 blit 进滚动缓存
+            拷贝(命令, 当前键, 0, 视频键缓存[索引], 槽 * 帧字节, 帧字节)
+            拷贝(命令, 当前值, 0, 视频值缓存[索引], 槽 * 帧字节, 帧字节)
 
             // 组装：[起始条件, 结束条件] + 最近 总帧数 帧视频（按时间升序，末帧为当前帧）
-            let 条件字节 = 条件行数 * 键值维 * (状态.半精度KV ? MemoryLayout<UInt16>.stride : MemoryLayout<Float>.stride)
+            let 条件字节 = 条件行数 * 键值维 * MemoryLayout<UInt16>.stride
             拷贝(命令, 条件键[索引], 0, 拼接键, 0, 条件字节)
             拷贝(命令, 条件值[索引], 0, 拼接值, 0, 条件字节)
-            let 首帧序 = 已出帧数 - 历史帧数
-            for j in 0..<总帧数 {
+            let 首帧序 = 已出帧数 - (参与帧数 - 1)
+            for j in 0..<参与帧数 {
                 let 源槽 = (首帧序 + j) % 最大历史帧
                 let 目标偏移 = 条件字节 + j * 帧字节
                 拷贝(命令, 视频键缓存[索引], 源槽 * 帧字节, 拼接键, 目标偏移, 帧字节)
@@ -1293,20 +1449,20 @@ nonisolated final class Flash引擎 {
             施加RoPE(命令, 拼接键, 条件行数, 形状.KV组数, 令牌宽, 令牌数,
                     时间位置: 0,
                     平面步长: Int32(max(状态总帧数, 1) - 1),
-                    半精度: 状态.半精度KV)
-            // 视频区逐平面施加 RoPE：最老帧 t=-历史帧数，逐平面 +1，当前帧 t=0
-            施加RoPE(命令, 拼接键, 总帧数 * 令牌数, 形状.KV组数, 令牌宽, 令牌数,
-                    时间位置: Int32(-历史帧数),
+                    半精度: true)
+            // 视频区逐平面施加 RoPE：最老帧 t=-(参与帧数-1)，逐平面 +1，当前帧 t=0
+            施加RoPE(命令, 拼接键, 参与帧数 * 令牌数, 形状.KV组数, 令牌宽, 令牌数,
+                    时间位置: Int32(-(参与帧数 - 1)),
                     平面步长: 1,
                     缓冲偏移: 条件字节,
-                    半精度: 状态.半精度KV)
+                    半精度: true)
 
             let 注意力输出 = 借(令牌数 * 维度)
             窗口注意力(命令, 查询, 拼接键, 拼接值, 注意力输出,
                     批次数: 1, 每批令牌: 令牌数,
                     令牌高: 令牌高, 令牌宽: 令牌宽,
-                    平面数: 2 + 总帧数, 条件平面数: 2, 窗口: 窗口, 时间窗: 0,
-                    半精度: 状态.半精度KV)
+                    平面数: 2 + 参与帧数, 条件平面数: 2, 窗口: 窗口, 时间窗: 时间窗帧数,
+                    半精度: true)
 
             let 投影 = 借(令牌数 * 维度)
             线性(命令, 注意力输出, 令牌数, 层.注意力.输出, 投影, false)
@@ -1381,7 +1537,7 @@ nonisolated final class Flash引擎 {
                                          channels: 3,
                                          outWidth: Int32(出宽),
                                          outHeight: Int32(出高))
-        派发(命令, 管线重排, MTLSize(width: 出宽, height: 出高, depth: 1),
+        派发(命令, 管线重排半, MTLSize(width: 出宽, height: 出高, depth: 1),
             MTLSize(width: 16, height: 16, depth: 1)) { 编码器 in
             编码器.setBuffer(残差, offset: 0, index: 0)
             编码器.setBuffer(残差图, offset: 0, index: 1)
@@ -1398,7 +1554,7 @@ nonisolated final class Flash引擎 {
         var 上采样参数 = BicubicParams(inH: Int32(高), inW: Int32(宽),
                                       outH: Int32(出高), outW: Int32(出宽),
                                       scale: Int32(配置.放大倍数), channels: 3)
-        派发(命令, 管线双三次, MTLSize(width: 出宽, height: 出高, depth: 1),
+        派发(命令, 管线双三次半, MTLSize(width: 出宽, height: 出高, depth: 1),
             MTLSize(width: 16, height: 16, depth: 1)) { 编码器 in
             编码器.setBuffer(低清, offset: 0, index: 0)
             编码器.setBuffer(残差图, offset: 0, index: 1)

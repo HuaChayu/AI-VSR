@@ -409,10 +409,10 @@ static inline float4 attn_取四(device const half* 基) { half4 h = *(device co
 #define ATTN_SS(KB) (((KB) + 8) > 36 ? ((KB) + 8) : 36)
 
 template <int QP, int KB, typename KVT>
-static inline void attn_mma_impl(device const float* q,
+static inline void attn_mma_impl(device const half* q,
                                  device const KVT* k,
                                  device const KVT* v,
-                                 device float* out,
+                                 device half* out,
                                  device const int2* windows,
                                  device const uchar* planeMask,
                                  constant AttnParams& p,
@@ -664,7 +664,7 @@ static inline void attn_mma_impl(device const float* q,
             for (int e = 0; e < 16; ++e) {
                 int d = 我键片 * 16 + e;
                 if (d >= 半 * 32 && d < 半 * 32 + 32) {
-                    out[基 + d] = Ob[我查询 * 32 + (d - 半 * 32)] * 倒数;
+                    out[基 + d] = half(Ob[我查询 * 32 + (d - 半 * 32)] * 倒数);
                 }
             }
         }
@@ -673,10 +673,10 @@ static inline void attn_mma_impl(device const float* q,
 }
 
 #define ATTN_KERNEL(名称, QP, KB, 类型)                                                       \
-kernel void 名称(device const float* q [[buffer(0)]],                                    \
+kernel void 名称(device const half* q [[buffer(0)]],                                    \
                  device const 类型* k [[buffer(1)]],                                      \
                  device const 类型* v [[buffer(2)]],                                      \
-                 device float* out [[buffer(3)]],                                         \
+                 device half* out [[buffer(3)]],                                         \
                  device const int2* windows [[buffer(4)]],                                \
                  device const uchar* planeMask [[buffer(5)]],                             \
                  constant AttnParams& p [[buffer(6)]],                                    \
@@ -710,6 +710,15 @@ kernel void flash_cast_f2h(device const float* src [[buffer(0)]],
 {
     if (int(gid) >= p.count) return;
     dst[gid] = half(src[gid]);
+}
+
+kernel void flash_cast_h2f(device const half* src [[buffer(0)]],
+                           device float* dst [[buffer(1)]],
+                           constant CopyParams& p [[buffer(2)]],
+                           uint gid [[thread_position_in_grid]])
+{
+    if (int(gid) >= p.count) return;
+    dst[gid] = float(src[gid]);
 }
 
 kernel void flash_rope_half(device half* x [[buffer(0)]],
@@ -827,4 +836,332 @@ kernel void flash_swiglu_bias_v4(device const float* inPtr [[buffer(0)]],
     r.z = (g.z / (1.0f + exp(-g.z))) * u.z;
     r.w = (g.w / (1.0f + exp(-g.w))) * u.w;
     out[size_t(row) * 列组 + c4] = r;
+}
+
+// ===========================================================================
+// 半精度激活全链（存储 half / 计算 fp32）
+//
+// 与上方 fp32 版逐条等价：读到即转 fp32、算完再写回 half；偏置与归一化权重
+// 保持 fp32 存放（数值更稳、且它们体量远小于激活）。激活缓冲因此全部省一半
+// 带宽，线性层两端不再需要 f2h / h2f 的独立转换 pass。
+// ===========================================================================
+
+kernel void flash_im2col_h(device const half* src [[buffer(0)]],
+                           device half* dst [[buffer(1)]],
+                           constant Im2ColParams& p [[buffer(2)]],
+                           uint2 gid [[thread_position_in_grid]])
+{
+    int row = gid.x;
+    int col = gid.y;
+    if (row >= p.outH * p.outW || col >= p.outCols) return;
+
+    float value = 0.0f;
+    if (col < p.realCols) {
+        int oy = row / p.outW;
+        int ox = row - oy * p.outW;
+        int kernelArea = p.kernelSize * p.kernelSize;
+        int channel = col / kernelArea;
+        int rest = col - channel * kernelArea;
+        int ky = rest / p.kernelSize;
+        int kx = rest - ky * p.kernelSize;
+        int iy = oy * p.stride - p.pad + ky;
+        int ix = ox * p.stride - p.pad + kx;
+        if (iy >= 0 && iy < p.inH && ix >= 0 && ix < p.inW) {
+            int index = (p.channelsLast != 0)
+                ? ((iy * p.inW + ix) * p.inC + channel)
+                : ((channel * p.inH + iy) * p.inW + ix);
+            value = float(src[index]);
+        }
+    }
+    dst[row * p.outCols + col] = half(value);
+}
+
+// 首层：外部低清帧是 fp32 张量，直接在这里落到半精度，免去单独一次转换 pass
+kernel void flash_im2col_f2h(device const float* src [[buffer(0)]],
+                             device half* dst [[buffer(1)]],
+                             constant Im2ColParams& p [[buffer(2)]],
+                             uint2 gid [[thread_position_in_grid]])
+{
+    int row = gid.x;
+    int col = gid.y;
+    if (row >= p.outH * p.outW || col >= p.outCols) return;
+
+    float value = 0.0f;
+    if (col < p.realCols) {
+        int oy = row / p.outW;
+        int ox = row - oy * p.outW;
+        int kernelArea = p.kernelSize * p.kernelSize;
+        int channel = col / kernelArea;
+        int rest = col - channel * kernelArea;
+        int ky = rest / p.kernelSize;
+        int kx = rest - ky * p.kernelSize;
+        int iy = oy * p.stride - p.pad + ky;
+        int ix = ox * p.stride - p.pad + kx;
+        if (iy >= 0 && iy < p.inH && ix >= 0 && ix < p.inW) {
+            int index = (p.channelsLast != 0)
+                ? ((iy * p.inW + ix) * p.inC + channel)
+                : ((channel * p.inH + iy) * p.inW + ix);
+            value = src[index];
+        }
+    }
+    dst[row * p.outCols + col] = half(value);
+}
+
+kernel void flash_bias_act_h(device half* x [[buffer(0)]],
+                             device const float* bias [[buffer(1)]],
+                             constant BiasParams& p [[buffer(2)]],
+                             uint2 gid [[thread_position_in_grid]])
+{
+    int row = gid.x;
+    int col = gid.y;
+    if (row >= p.rows || col >= p.cols) return;
+    int index = row * p.cols + col;
+    float value = float(x[index]);
+    if (p.hasBias != 0) value += bias[col];
+    if (p.act == 1) value = value / (1.0f + exp(-value));
+    x[index] = half(value);
+}
+
+kernel void flash_bias_act_v4_h(device half* xPtr [[buffer(0)]],
+                                device const float* bPtr [[buffer(1)]],
+                                constant BiasParams& p [[buffer(2)]],
+                                uint2 gid [[thread_position_in_grid]])
+{
+    int c4 = int(gid.x), row = int(gid.y);
+    int 列组 = p.cols >> 2;
+    if (c4 >= 列组 || row >= p.rows) return;
+    device half4* x = (device half4*)xPtr;
+    device const float4* b = (device const float4*)bPtr;
+    size_t idx = size_t(row) * 列组 + c4;
+    float4 v = float4(x[idx]);
+    if (p.hasBias != 0) {
+        float4 bb = b[c4];
+        v.x += bb.x; v.y += bb.y; v.z += bb.z; v.w += bb.w;
+    }
+    if (p.act == 1) {
+        v.x = v.x / (1.0f + exp(-v.x));
+        v.y = v.y / (1.0f + exp(-v.y));
+        v.z = v.z / (1.0f + exp(-v.z));
+        v.w = v.w / (1.0f + exp(-v.w));
+    }
+    x[idx] = half4(v);
+}
+
+kernel void flash_rmsnorm_h(device const half* x [[buffer(0)]],
+                            device const float* weight [[buffer(1)]],
+                            device half* out [[buffer(2)]],
+                            constant NormParams& p [[buffer(3)]],
+                            uint groupId [[threadgroup_position_in_grid]],
+                            uint lane [[thread_position_in_threadgroup]],
+                            uint groupSize [[threads_per_threadgroup]])
+{
+    int row = int(groupId);
+    int base = row * p.cols;
+
+    float accSum = 0.0f;
+    for (int i = int(lane); i < p.cols; i += int(groupSize)) {
+        float v = float(x[base + i]);
+        accSum += v * v;
+    }
+    accSum = simd_sum(accSum);
+
+    threadgroup float partial[32];
+    int warp = int(lane) / 32;
+    int warpLane = int(lane) % 32;
+    if (warpLane == 0) partial[warp] = accSum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (warp == 0) {
+        int warps = int(groupSize) / 32;
+        float v = (warpLane < warps) ? partial[warpLane] : 0.0f;
+        v = simd_sum(v);
+        if (warpLane == 0) partial[0] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float scale = rsqrt(partial[0] / float(p.cols) + p.eps);
+    for (int i = int(lane); i < p.cols; i += int(groupSize)) {
+        out[base + i] = half(float(x[base + i]) * scale * weight[i]);
+    }
+}
+
+kernel void flash_swiglu_h(device const half* gateUp [[buffer(0)]],
+                           device half* out [[buffer(1)]],
+                           constant BiasParams& p [[buffer(2)]],
+                           uint2 gid [[thread_position_in_grid]])
+{
+    int row = int(gid.x);
+    int col = int(gid.y);
+    if (row >= p.rows || col >= p.cols) return;
+    int hidden = p.cols;
+    float gate = float(gateUp[row * (2 * hidden) + col]);
+    float up = float(gateUp[row * (2 * hidden) + hidden + col]);
+    float silu = gate / (1.0f + exp(-gate));
+    out[row * hidden + col] = half(silu * up);
+}
+
+kernel void flash_swiglu_v4_h(device const half* inPtr [[buffer(0)]],
+                              device half* outPtr [[buffer(1)]],
+                              constant BiasParams& p [[buffer(2)]],
+                              uint2 gid [[thread_position_in_grid]])
+{
+    int c4 = int(gid.x), row = int(gid.y);
+    int 列组 = p.cols >> 2;
+    if (c4 >= 列组 || row >= p.rows) return;
+    device const half4* in = (device const half4*)inPtr;
+    device half4* out = (device half4*)outPtr;
+    size_t 行基 = size_t(row) * 列组 * 2;
+    float4 g = float4(in[行基 + c4]);
+    float4 u = float4(in[行基 + 列组 + c4]);
+    float4 r;
+    r.x = (g.x / (1.0f + exp(-g.x))) * u.x;
+    r.y = (g.y / (1.0f + exp(-g.y))) * u.y;
+    r.z = (g.z / (1.0f + exp(-g.z))) * u.z;
+    r.w = (g.w / (1.0f + exp(-g.w))) * u.w;
+    out[size_t(row) * 列组 + c4] = half4(r);
+}
+
+kernel void flash_swiglu_bias_v4_h(device const half* inPtr [[buffer(0)]],
+                                   device const float* bPtr [[buffer(1)]],
+                                   device half* outPtr [[buffer(2)]],
+                                   constant BiasParams& p [[buffer(3)]],
+                                   uint2 gid [[thread_position_in_grid]])
+{
+    int c4 = int(gid.x), row = int(gid.y);
+    int 列组 = p.cols >> 2;
+    if (c4 >= 列组 || row >= p.rows) return;
+    device const half4* in = (device const half4*)inPtr;
+    device const float4* b = (device const float4*)bPtr;
+    device half4* out = (device half4*)outPtr;
+    size_t 行基 = size_t(row) * 列组 * 2;
+    float4 g = float4(in[行基 + c4]);
+    float4 u = float4(in[行基 + 列组 + c4]);
+    if (p.hasBias != 0) {
+        float4 bb = b[c4];
+        g.x += bb.x; g.y += bb.y; g.z += bb.z; g.w += bb.w;
+    }
+    float4 r;
+    r.x = (g.x / (1.0f + exp(-g.x))) * u.x;
+    r.y = (g.y / (1.0f + exp(-g.y))) * u.y;
+    r.z = (g.z / (1.0f + exp(-g.z))) * u.z;
+    r.w = (g.w / (1.0f + exp(-g.w))) * u.w;
+    out[size_t(row) * 列组 + c4] = half4(r);
+}
+
+kernel void flash_add_h(device const half* a [[buffer(0)]],
+                        device const half* b [[buffer(1)]],
+                        device half* out [[buffer(2)]],
+                        constant CopyParams& p [[buffer(3)]],
+                        uint gid [[thread_position_in_grid]])
+{
+    int i = int(gid);
+    if (i >= p.count) return;
+    out[i] = half(float(a[i]) + float(b[i]));
+}
+
+kernel void flash_add_inplace_h(device half* a [[buffer(0)]],
+                                device const half* b [[buffer(1)]],
+                                constant CopyParams& p [[buffer(2)]],
+                                uint gid [[thread_position_in_grid]])
+{
+    int i = int(gid);
+    if (i >= p.count) return;
+    a[i] = half(float(a[i]) + float(b[i]));
+}
+
+kernel void flash_add_row_vector_h(device half* x [[buffer(0)]],
+                                   device const float* vec [[buffer(1)]],
+                                   constant BiasParams& p [[buffer(2)]],
+                                   uint2 gid [[thread_position_in_grid]])
+{
+    int row = int(gid.x);
+    int col = int(gid.y);
+    if (row >= p.rows || col >= p.cols) return;
+    int index = row * p.cols + col;
+    x[index] = half(float(x[index]) + vec[col]);
+}
+
+kernel void flash_copy_h(device const half* src [[buffer(0)]],
+                         device half* dst [[buffer(1)]],
+                         constant CopyParams& p [[buffer(2)]],
+                         uint gid [[thread_position_in_grid]])
+{
+    int i = int(gid);
+    if (i >= p.count) return;
+    dst[i] = src[i];
+}
+
+kernel void flash_pixel_shuffle_h(device const half* src [[buffer(0)]],
+                                  device half* dst [[buffer(1)]],
+                                  constant PixelShuffleParams& p [[buffer(2)]],
+                                  uint2 gid [[thread_position_in_grid]])
+{
+    int ox = int(gid.x);
+    int oy = int(gid.y);
+    if (ox >= p.outWidth || oy >= p.outHeight) return;
+
+    int tokenX = ox / p.scale;
+    int subX = ox - tokenX * p.scale;
+    int tokenY = oy / p.scale;
+    int subY = oy - tokenY * p.scale;
+    int token = tokenY * p.tokenWidth + tokenX;
+    int sub = subY * p.scale + subX;
+    int channelStride = p.scale * p.scale;
+
+    for (int c = 0; c < p.channels; c++) {
+        dst[(c * p.outHeight + oy) * p.outWidth + ox] =
+            src[token * (p.channels * channelStride) + c * channelStride + sub];
+    }
+}
+
+// 双三次上采样 + 残差：两端输入为 half，累加仍在 fp32，结果直接写成 fp32 输出张量，
+// 省掉「先落 half 再 h2f 整个输出图」的一次多余 pass。
+kernel void flash_bicubic_add_h(device const float* lr [[buffer(0)]],
+                                device const half* residual [[buffer(1)]],
+                                device float* out [[buffer(2)]],
+                                constant BicubicParams& p [[buffer(3)]],
+                                uint2 gid [[thread_position_in_grid]])
+{
+    int ox = int(gid.x);
+    int oy = int(gid.y);
+    if (ox >= p.outW || oy >= p.outH) return;
+
+    float sx = (float(ox) + 0.5f) / float(p.scale) - 0.5f;
+    float sy = (float(oy) + 0.5f) / float(p.scale) - 0.5f;
+    int ix0 = int(floor(sx));
+    int iy0 = int(floor(sy));
+    float fx = sx - float(ix0);
+    float fy = sy - float(iy0);
+
+    float wx[4];
+    float wy[4];
+    wx[0] = flash_cubic_weight(1.0f + fx);
+    wx[1] = flash_cubic_weight(fx);
+    wx[2] = flash_cubic_weight(1.0f - fx);
+    wx[3] = flash_cubic_weight(2.0f - fx);
+    wy[0] = flash_cubic_weight(1.0f + fy);
+    wy[1] = flash_cubic_weight(fy);
+    wy[2] = flash_cubic_weight(1.0f - fy);
+    wy[3] = flash_cubic_weight(2.0f - fy);
+
+    int xs[4];
+    int ys[4];
+    for (int i = 0; i < 4; i++) {
+        xs[i] = min(max(ix0 - 1 + i, 0), p.inW - 1);
+        ys[i] = min(max(iy0 - 1 + i, 0), p.inH - 1);
+    }
+
+    for (int c = 0; c < p.channels; c++) {
+        float acc = 0.0f;
+        device const float* plane = lr + c * p.inH * p.inW;
+        for (int j = 0; j < 4; j++) {
+            float rowAcc = 0.0f;
+            for (int i = 0; i < 4; i++) {
+                rowAcc += wx[i] * float(plane[ys[j] * p.inW + xs[i]]);
+            }
+            acc += wy[j] * rowAcc;
+        }
+        int index = (c * p.outH + oy) * p.outW + ox;
+        out[index] = acc + float(residual[index]);
+    }
 }

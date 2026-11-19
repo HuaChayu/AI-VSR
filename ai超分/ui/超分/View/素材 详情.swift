@@ -50,6 +50,10 @@ struct 素材详情: View {
         .onAppear {
             // 空格监听已在 App 启动时装好（MyApp.swift），这里只把「空格做什么」挂到播放内核上
             播放器.挂到全局快捷键()
+            超分.展示素材id = 素材.选中
+            // 视图重新挂载时把已经跑完的素材补一次角标：onChange 只听「变化」，
+            // 重建期间跑完的那条不会重放，这里按 刚完成 里的 id 补点亮。
+            for id in 超分.刚完成 { 素材.标记完成(id) }
         }
         .onDisappear {
             播放器.暂停()
@@ -58,13 +62,15 @@ struct 素材详情: View {
         .onChange(of: 素材.选中条目?.url) { _, _ in
             提示条 = nil
             对比缩放 = 1
+            // 展示的成品跟着选中走：切到谁就只看谁自己的成品，别的素材的成果不会串过来。
+            超分.展示素材id = 素材.选中
             超分.清空()
             // 切回已超分过的素材：按落盘索引从磁盘产物重建对比层，不必重新推理。
             guard let 条目 = 素材.选中条目 else { return }
             Task { @MainActor in
                 guard 素材.选中 == 条目.id else { return }
                 await 超分.恢复缓存(素材: 条目)
-                guard 超分.阶段 == .完成, 超分.产物 != nil, 素材.选中 == 条目.id else { return }
+                guard 超分.产物 != nil, 素材.选中 == 条目.id else { return }
                 素材.标记完成(条目.id)
             }
         }
@@ -72,12 +78,10 @@ struct 素材详情: View {
             // 换了一批超分结果就回到整图适配，避免沿上一张的放大倍率跳变
             对比缩放 = 1
         }
-        .onChange(of: 超分.阶段) { _, 阶段 in
-            // 超分跑完 → 发起这次超分的那条素材在素材栏右上角点亮「完成」对勾。
-            // 必须同时是当前选中条目：批量超分跑的是别的条目，不能把结果记到这条头上。
-            if 阶段 == .完成, let id = 超分素材, id == 素材.选中 {
-                素材.标记完成(id)
-            }
+        .onChange(of: 超分.刚完成) { _, 完成表 in
+            // 跑完哪条就点亮哪条：队列连跑时会连着跑完好几条，按 刚完成 里的 id 逐个点亮，
+            // 不按「当前选中」猜，免得把上一条的结果记到下一条头上。
+            for id in 完成表 { 素材.标记完成(id) }
         }
     }
 
@@ -109,7 +113,8 @@ struct 素材详情: View {
                 画面(容器: 几何.size)
                     .clipped()
 
-                if 超分.运行中 {
+                // 只要引擎在干活就显示：切到别的素材也照样看到「轮到谁、第几帧」。
+                if 超分.忙 {
                     VStack(spacing: 8) {
                         if let 比例 = 超分.视频进度比例 {
                             ProgressView(value: 比例)
@@ -118,17 +123,18 @@ struct 素材详情: View {
                         } else {
                             ProgressView().controlSize(.small)
                         }
-                        Text(超分.视频运行
-                             ? "整段超分中 \(超分.视频已处理)/\(max(超分.视频总数, 超分.视频已处理)) 帧"
-                             : "Flash 4x 推理中…")
+                        Text(超分.进度摘要)
                             .font(.system(size: 10))
                             .foregroundStyle(Theme.textSecondary)
                     }
-                    .padding(14)
+                    .padding(12)
                     .background(
                         RoundedRectangle(cornerRadius: 10, style: .continuous)
                             .fill(Theme.panelBackground.opacity(0.9))
                     )
+                    // 贴右上角：进度是全局信息，别压在画面中间挡着看素材。
+                    .padding(12)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
                 }
 
                 // 权重缺失时：先下载再超分，下载期间不进入超分流程
@@ -250,36 +256,6 @@ struct 素材详情: View {
                 guard 并起跑, 播放器.播放中 else { return }
                 双路同刻起跑()
             }
-        }
-    }
-
-    /// 两路按同一 hostTime 同刻起跑：起点取宿主时钟 +60ms，各自从自身播放头开始。
-    /// 硬性前提（AVFoundation 实测）：automaticallyWaitsToMinimizeStalling 必须为 false，
-    /// 且 player.status 必须已 readyToPlay，否则 setRate(_:time:atHostTime:) 直接抛
-    /// NSInvalidArgumentException 崩掉 App。两条都不满足时退化成普通 play()，绝不硬调。
-    private func 同刻起跑双路() {
-        // 源路永远只播原始素材：地址一旦和选中条目不一致就先纠正，绝不让它播到成片上
-        if let 条目 = 素材.选中条目, 源片播放器.地址 != 条目.url {
-            源片播放器.装入(地址: 条目.url, 种类: .视频)
-        }
-        // 循环回零的正确姿势：先把两路各自归零（seek 是异步的），都归好位再一次性同刻起跑。
-        // 不能在 seek 还没完成时就 setRate，否则那一路会停在 seek 落点上（表现为「停在第一帧」）。
-        归零若在末帧(播放器) {
-            归零若在末帧(源片播放器) {
-                双路同刻起跑()
-            }
-        }
-    }
-
-    /// 上一遍播到末尾的（含循环回零瞬间）先精确归零，归好再继续；其余情况直接继续。
-    private func 归零若在末帧(_ 内核: 预览播放器, 完成: @escaping () -> Void) {
-        let 时 = 内核.播放器.currentTime()
-        if 内核.总时长 > 0.2, 时.seconds >= 内核.总时长 - 0.05 {
-            内核.播放器.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero) { _ in
-                Task { @MainActor in 完成() }
-            }
-        } else {
-            完成()
         }
     }
 
@@ -671,8 +647,20 @@ struct 素材详情: View {
                 .controlSize(.small)
             }
 
-            if 超分.视频运行 {
-                Button("取消") { 超分.取消视频() }
+            // 取消只属于「正在被引擎跑的那一条」：按钮按本条素材 id 判，跟全局 视频运行 无关，
+            // 别人的素材在跑不会在本页冒出取消按钮。
+            if 超分.本条在跑 {
+                Button(超分.取消中 ? "取消中…" : "取消") {
+                    if let 目标 = 素材.选中 { 超分.取消(素材id: 目标) }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(超分.取消中)
+            }
+
+            // 本条已在队里等着：单独的撤回入口，不连累正在跑的那条。
+            if 超分.本条排队中, let 待撤 = 素材.选中 {
+                Button("取消排队") { 超分.取消排队(待撤) }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
             }
@@ -680,7 +668,8 @@ struct 素材详情: View {
             Button(超分.按钮标题) { 开始超分() }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.small)
-                .disabled(超分.运行中 || 权重下载管理.共享.下载中 || !可开始当前素材)
+                // 忙的时候也要能点：点下去是排队，不是没反应。只有本条自己在跑、或本条已经在队里才禁用。
+                .disabled(超分.本条在跑 || 超分.本条排队中 || 权重下载管理.共享.下载中 || !可开始当前素材)
         }
         .padding(.horizontal, Theme.padding)
         .padding(.vertical, 10)

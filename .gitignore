@@ -10,3 +10,58 @@ DerivedData/
 
 # 其他
 *.xcuserstate
+*.xcscmblueprint
+*.moved-aside
+*.hmap
+*.ipa
+
+# 构建产物（本工程构建实际落在项目外的 DerivedData，此处兜底）
+build/
+Build/
+DerivedData*/
+*.app/
+*.dSYM/
+*.dSYM.zip
+
+# 打包产物
+*.dmg
+*.pkg
+*.zip
+output/
+temp/
+
+# 模型权重与大数据文件（体积过大，不入库）
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.mlmodel
+*.mlpackage
+*.mlmodelc
+*.metallib
+*.bin
+*.gguf
+模型/
+models/
+
+# 视频与图片素材（仅保留 Assets.xcassets 内的资源）
+*.mp4
+*.mov
+*.m4v
+*.avi
+*.webm
+*.wav
+*.mp3
+
+# 依赖与工具目录
+Pods/
+.swiftpm/
+.build/
+node_modules/
+
+# 备份文件
+*.bak
+*.bak-*
+*.orig
+*~

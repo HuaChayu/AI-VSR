@@ -250,6 +250,11 @@ nonisolated enum 视频超分 {
             var 端点首: CGImage?
             var 端点末: CGImage?
             while let 端点样本 = 取样本(端点输出) {
+                // 大视频抽首末帧要扫完整个文件，这段没有检查点，会让「取消」看起来完全没反应。
+                if 取消() {
+                    端点读.cancelReading()
+                    throw 超分错误(说明: "已取消")
+                }
                 guard let 端点像素 = CMSampleBufferGetImageBuffer(端点样本),
                       let 端点图 = 转正图(端点像素, 变换: 变换, 上下文: ci上下文, 回退空间: 源口径.空间) else { continue }
                 if 端点首 == nil { 端点首 = 端点图 }
@@ -259,6 +264,8 @@ nonisolated enum 视频超分 {
             guard let 首帧图 = 端点首, let 末帧图 = 端点末 else {
                 throw 超分错误(说明: "端点帧抽取失败")
             }
+            // 两次端点 Wan 前向是单帧级等待，同样给一个取消出口。
+            if 取消() { throw 超分错误(说明: "已取消") }
             let 首端 = try 超分通道.端点潜变量(首帧图, 短边上限: 短边上限, 输入解码: 源口径.编码)
             let 末端 = try 超分通道.端点潜变量(末帧图, 短边上限: 短边上限, 输入解码: 源口径.编码)
             起始潜变量 = 首端.潜变量
@@ -429,6 +436,15 @@ nonisolated enum 视频超分 {
             + 探针["Flash", default: 0] + 探针["回归", default: 0]
         let 总毫秒 = max(1.0, 总耗时秒 * 1000)
         func 占比(_ 毫秒: Double) -> String { String(format: "%.1f%%", 毫秒 / 总毫秒 * 100) }
+        // 单任务完成耗时报告：一行结论写进日志、输出目录 report.txt（追加）与控制台，手动测试直接取用。
+        let 完成行 = String(format: "完成 %@ | 总耗时 %.1f s | 帧数 %d | 单帧均耗 %.0f ms\n",
+                         输出.lastPathComponent, 总耗时秒, 已处理, 总毫秒 / Double(max(1, 已处理)))
+        日志 += 完成行
+        print("=== 完成报告 " + 完成行.trimmingCharacters(in: .newlines))
+        let 报告地址 = 输出.deletingLastPathComponent().appendingPathComponent("report.txt")
+        let 旧报告 = (try? String(contentsOf: 报告地址, encoding: .utf8)) ?? ""
+        try? (旧报告 + 完成行).write(to: 报告地址, atomically: true, encoding: .utf8)
+
         var 摘要 = "\n=== 基线摘要 ===\n"
         摘要 += String(format: "吞吐 总耗时 %.1f s | 帧数 %d | 单帧均耗 %.0f ms | 内存峰值 %.0f MB\n",
                       总耗时秒, 已处理, 总毫秒 / Double(max(1, 已处理)), 内存峰值MB)

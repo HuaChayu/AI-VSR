@@ -163,20 +163,24 @@ struct 素材栏: View {
 
     // MARK: 底部动作（批量超分 / 清空素材箱）
 
-    /// 批量超分：空闲时把未超分素材按列表顺序排队，运行中显示「批量 n/总数」并支持再次点击中止。
+    /// 本批还有活：只影响图标与标题写法，不影响点击语义（点击永远是「把没进队列的排进去」）。
+    private var 批量在跑: Bool { 批量.在途(超分) > 0 }
+
+    /// 批量超分：把素材库里还没进队列的素材按列表顺序逐条排进同一条串行队列。
+    /// 再次点击不会撤出任何条目，只是把新出现的待办补进队列——手动取消掉的那条也会在这一步被重新排进去。
     private var 批量超分按钮: some View {
         Button {
-            批量.切换(素材: 素材, 超分: 超分)
+            批量.入队(素材: 素材, 超分: 超分)
         } label: {
             HStack(spacing: 4) {
-                Image(systemName: 批量.运行 ? "hourglass" : "square.stack.3d.up.fill")
+                Image(systemName: 批量在跑 ? "hourglass" : "square.stack.3d.up.fill")
                     .font(.system(size: 9, weight: .semibold))
-                Text(批量.按钮标题)
+                Text(批量.按钮标题(超分))
                     .font(.system(size: 10, weight: .medium))
                     .lineLimit(1)
                     .monospacedDigit()
             }
-            .foregroundStyle(批量.运行 ? Theme.accent : Theme.textSecondary)
+            .foregroundStyle(批量在跑 ? Theme.accent : Theme.textSecondary)
             .padding(.horizontal, 7)
             .padding(.vertical, 3)
             .background {
@@ -185,21 +189,22 @@ struct 素材栏: View {
             }
             .overlay {
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .strokeBorder(批量.运行 ? Theme.accent.opacity(0.55) : Theme.stroke, lineWidth: 1)
+                    .strokeBorder(批量在跑 ? Theme.accent.opacity(0.55) : Theme.stroke, lineWidth: 1)
             }
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .disabled(!批量按钮可用)
-        .opacity(素材.条目.isEmpty ? 0.45 : 1)
+        .opacity(批量按钮可用 ? 1 : 0.45)
         .help(批量.悬停提示)
     }
 
-    /// 队列自己在跑时必须可点（它是中止入口），只有「别处正在超分」或空列表才禁用
+    /// 有「未完成 且 不在跑 且 不在排队」的素材才点亮：点了就有东西入队，没有就置灰。
+    /// 判定只看素材库现状，不掺批次、已落定之类的记账，所以取消掉一条后会立刻重新点亮。
     private var 批量按钮可用: Bool {
-        guard !素材.条目.isEmpty else { return false }
-        if 批量.运行 { return true }
-        return !超分.运行中 && !超分.视频运行
+        素材.条目.contains { 条目 in
+            !条目.完成 && 条目.id != 超分.运行素材id && !超分.在排队(条目.id)
+        }
     }
 
     /// 清空素材箱：仅移出素材列表，不删除磁盘上的源文件与已生成的超分产物。
@@ -337,130 +342,70 @@ struct 素材栏: View {
 
 // MARK: - 批量超分队列
 
-/// 把素材箱里尚未超分的条目按列表顺序串行送进 超分通道：一条跑完自动跑下一条，
-/// 每条成功后回写 素材.完成（素材栏缩略图右上角对勾）。运行中再次点击可中止剩余队列。
+/// 批量按钮的唯一语义：把素材库里「未完成 且 不在跑 且 不在排队」的素材按列表顺序逐条排进
+/// 超分通道的同一条按 id 队列，与单条点击共用一套排队/取消语义：被排上的素材在详情页就是「已排队」，
+/// 可单独撤出；跑完由 刚完成 → 素材.完成 点亮对勾。
+/// 再次点击不会撤出任何东西——它只是把又一次出现的待办补进队列，
+/// 所以手动取消掉的某条只要还没完成，下一次点击就会被重新排进去。
 @MainActor
 @Observable
 final class 批量超分队列 {
-    /// 剩余待跑条目（按列表顺序，队首是下一条）
-    private(set) var 队列: [UUID] = []
-    private(set) var 总数 = 0
-    private(set) var 完成数 = 0
-    private(set) var 失败数 = 0
-    private(set) var 运行 = false
+    /// 本批纳入的素材 id（按列表顺序）。
+    /// 批次只回答「这一批是谁」，真正的排队、串行执行、按 id 取消全部交给 超分.排队 那一套队列，
+    /// 不再有第二条独立执行路线——所以被批量带上的素材在详情页就是「已排队」，可单独取消。
+    private(set) var 批次: [UUID] = []
 
-    @ObservationIgnored private var 任务: Task<Void, Never>?
-    @ObservationIgnored private var 已请求中止 = false
+    var 总数: Int { 批次.count }
 
-    /// 当前正在跑第几条（1 起），未运行时为 0
-    var 当前序号: Int {
-        guard 运行 else { return 0 }
-        return min(总数, 完成数 + 失败数 + 1)
+    /// 这批还有几条在队里等着或正在跑（0 = 这批没有活的了）。只用于显示进度，不参与按钮可用性判断。
+    func 在途(_ 超分: 超分通道) -> Int {
+        批次.filter { $0 == 超分.运行素材id || 超分.在排队($0) }.count
     }
 
-    var 按钮标题: String {
-        运行 ? "批量 \(当前序号)/\(总数)" : "批量超分"
+    /// 这批已经落定的条数（跑完、失败、被单独撤出队列都算落定）
+    func 已落定(_ 超分: 超分通道) -> Int {
+        max(0, 批次.count - 在途(超分))
+    }
+
+    /// 标题只有两种形态：「批量超分」或「批量 n/总数」，没有第二种语义。
+    func 按钮标题(_ 超分: 超分通道) -> String {
+        guard 总数 > 0, 在途(超分) > 0 else { return "批量超分" }
+        return "批量 \(已落定(超分))/\(总数)"
     }
 
     var 悬停提示: String {
-        if 运行 {
-            return "正在批量超分：第 \(当前序号)/\(总数) 条，再次点击可中止剩余队列（当前这条跑完即停）"
-        }
-        return "把未超分的素材按列表顺序逐条超分（已完成的自动跳过）"
+        "把素材库里还没超分、也不在队列里的素材按列表顺序逐条排进同一条串行队列（已完成的、已在队列里的自动跳过）；再次点击只是把新的待办补进队列，不会撤出任何条目"
     }
 
-    /// 按钮入口：空闲时开始排队，运行中则中止剩余队列。
-    func 切换(素材: 素材Store, 超分: 超分通道) {
-        if 运行 { 中止(); return }
-        开始(素材: 素材, 超分: 超分)
-    }
-
-    /// 中止剩余队列（当前这条不被打断，跑完即停）
-    func 中止() {
-        guard 运行 else { return }
-        已请求中止 = true
-        队列.removeAll()
-    }
-
-    /// 清空素材箱时调用：立即丢弃队列并解除运行态（单帧 / 整段的中止由 超分.清空() 负责）
-    func 取消全部() {
-        已请求中止 = true
-        队列.removeAll()
-        运行 = false
-        任务?.cancel()
-        任务 = nil
-        总数 = 0
-        完成数 = 0
-        失败数 = 0
-    }
-
-    private func 开始(素材: 素材Store, 超分: 超分通道) {
-        guard !超分.运行中, !超分.视频运行 else {
-            素材.onNote?("正在超分中，等这一条跑完再批量")
-            return
-        }
-        let 待跑 = 素材.条目.filter { !$0.完成 }
-        guard !待跑.isEmpty else {
-            素材.onNote?("素材都已超分完成，没有需要批量处理的条目")
-            return
-        }
+    /// 点击入口：永远只做「把还没有进队列的素材排进队列」，没有第二种行为。
+    func 入队(素材: 素材Store, 超分: 超分通道) {
         guard 超分.可运行 else {
             素材.onNote?("超分权重未就绪，先点「开始超分」完成下载再批量")
             return
         }
-
-        队列 = 待跑.map(\.id)
-        总数 = 待跑.count
-        完成数 = 0
-        失败数 = 0
-        已请求中止 = false
-        运行 = true
-        素材.onNote?("开始批量超分：共 \(总数) 条待跑")
-
-        任务 = Task { @MainActor in
-            await 逐条执行(素材: 素材, 超分: 超分)
+        // 只挑真正的待办：没完成、不是正在跑的那条、也不在队列里等着。
+        // 手动取消排队或被取消掉的条目在这里会被重新捡起来，因为取消只动队列、不动 完成 标记。
+        let 待跑 = 素材.条目.filter { 条目 in
+            !条目.完成 && 条目.id != 超分.运行素材id && !超分.在排队(条目.id)
         }
-    }
-
-    private func 逐条执行(素材: 素材Store, 超分: 超分通道) async {
-        while !队列.isEmpty, !已请求中止, !Task.isCancelled {
-            let id = 队列.removeFirst()
-            guard let 条目 = 素材.条目.first(where: { $0.id == id }), !条目.完成 else { continue }
-
-            // 每条开始前清空一次，避免上一条的产物与提示串到这一条上
-            超分.清空()
+        guard !待跑.isEmpty else {
+            素材.onNote?("没有需要批量处理的条目（都已完成或已在队列里）")
+            return
+        }
+        // 批次只记账，用于显示「批量 n/总数」：上一批还在队里的继续算，再把这一批新排的接上。
+        批次 = 批次.filter { $0 == 超分.运行素材id || 超分.在排队($0) }
+        for 条目 in 待跑 where !批次.contains(条目.id) {
+            批次.append(条目.id)
+        }
+        // 逐条走统一入口，自带「在跑/在队则跳过，忙则入队，闲则直跑」，仍然严格串行独占引擎。
+        for 条目 in 待跑 {
             超分.开始(素材: 条目, 预览帧: 条目.缩略图)
-
-            let 结果 = await 等待落定(超分: 超分)
-            switch 结果 {
-            case .完成:
-                素材.标记完成(id)
-                完成数 += 1
-            case .失败:
-                失败数 += 1
-            default:
-                // 被换素材或清空素材箱打断：剩余队列直接作废
-                已请求中止 = true
-            }
         }
-
-        let 实际完成 = 完成数
-        let 实际失败 = 失败数
-        运行 = false
-        队列.removeAll()
-        任务 = nil
-        guard !Task.isCancelled else { return }
-        var 文本 = "批量超分结束：完成 \(实际完成) 条"
-        if 实际失败 > 0 { 文本 += "，失败 \(实际失败) 条" }
-        if 已请求中止, 实际完成 + 实际失败 < 总数 { 文本 += "（已中止剩余队列）" }
-        素材.onNote?(文本)
+        素材.onNote?("已把 \(待跑.count) 条排进队列，按顺序逐条超分")
     }
 
-    /// 等这次超分落到终态（完成 / 失败 / 空闲）并返回该状态
-    private func 等待落定(超分: 超分通道) async -> 超分通道.进度 {
-        while 超分.阶段 == .运行, !Task.isCancelled {
-            try? await Task.sleep(nanoseconds: 150_000_000)
-        }
-        return 超分.阶段
+    /// 清空素材箱时调用：丢掉批次账（真正的中止由 超分.中止全部() 负责）
+    func 取消全部() {
+        批次.removeAll()
     }
 }
